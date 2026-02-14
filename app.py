@@ -137,7 +137,7 @@ def generate_synthetic_transactions(
                     "amount": float(a),
                     "currency": "GBP",
                     "direction": d,
-                    "channel": rng.choice(["card", "cash"], p=[0.4, 0.5, 0.1]),
+                    "channel": rng.choice(["card", "cash", "bank_transfer"], p=[0.4, 0.5, 0.1]),
                     "country": rng.choice(["GB", "US", "DE", "PT", "FR"], p=[0.5, 0.15, 0.1, 0.15, 0.1]),
                 }
             )
@@ -243,58 +243,46 @@ def score_anomalies(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     # Treat missing as 0
     df["is_velocity_burst"] = df["tx_count_1h"].fillna(0).astype(float) >= float(cfg.velocity_count_1h_threshold)
 
-    # Apply rules + score + reasons
-    scores = []
-    severities = []
-    reasons_out: List[List[str]] = []
-    flagged = []
+    amount_mask = df["amount_z"].fillna(0.0) >= cfg.amount_z_threshold
+    velocity_mask = df["is_velocity_burst"].fillna(False)
+    sum24h_mask = df["sum24h_z"].fillna(0.0) >= cfg.sum24h_z_threshold
+    counterparty_mask = df["is_new_counterparty"].fillna(False)
+    duplicate_mask = df["is_duplicate_txid"].fillna(False)
 
-    for _, r in df.iterrows():
-        score = 0
-        reasons = []
+    df["score"] = (
+        duplicate_mask.astype(int) * cfg.score_duplicate_txid
+        + amount_mask.astype(int) * cfg.score_amount_outlier
+        + velocity_mask.astype(int) * cfg.score_velocity_burst
+        + sum24h_mask.astype(int) * cfg.score_sum24h_spike
+        + counterparty_mask.astype(int) * cfg.score_new_counterparty
+    ).clip(upper=cfg.score_cap)
 
-        if bool(r.get("is_duplicate_txid", False)):
-            score += cfg.score_duplicate_txid
+    df["severity"] = np.select(
+        [df["score"] >= 80, df["score"] >= 50, df["score"] > 0],
+        ["High", "Medium", "Low"],
+        default="None",
+    )
+    df["is_flagged"] = df["score"] > 0
+
+    def _build_reasons(r: pd.Series) -> List[str]:
+        reasons: List[str] = []
+        if bool(r["is_duplicate_txid"]):
             reasons.append("Duplicate transaction_id")
 
-        if float(r.get("amount_z", 0.0)) >= cfg.amount_z_threshold:
-            score += cfg.score_amount_outlier
+        if bool(r["amount_trigger"]):
             reasons.append(f"Unusual amount for this account (robust_z={r['amount_z']:.2f})")
 
-        if bool(r.get("is_velocity_burst", False)):
-            score += cfg.score_velocity_burst
+        if bool(r["is_velocity_burst"]):
             reasons.append(f"High transaction velocity (tx_count_1h={int(r['tx_count_1h'])})")
 
-        if float(r.get("sum24h_z", 0.0)) >= cfg.sum24h_z_threshold:
-            score += cfg.score_sum24h_spike
+        if bool(r["sum24h_trigger"]):
             reasons.append(f"Unusually high 24h total (robust_z={r['sum24h_z']:.2f})")
 
-        if bool(r.get("is_new_counterparty", False)):
-            score += cfg.score_new_counterparty
+        if bool(r["is_new_counterparty"]):
             reasons.append("New counterparty for this account")
 
-        score = min(score, cfg.score_cap)
-
-        if score >= 80:
-            sev = "High"
-        elif score >= 50:
-            sev = "Medium"
-        elif score > 0:
-            sev = "Low"
-        else:
-            sev = "None"
-
-        is_flagged = score > 0
-
-        scores.append(score)
-        severities.append(sev)
-        reasons_out.append(reasons)
-        flagged.append(is_flagged)
-
-    df["score"] = scores
-    df["severity"] = severities
-    df["reasons"] = reasons_out
-    df["is_flagged"] = flagged
+        reason_frame = df.assign(amount_trigger=amount_mask, sum24h_trigger=sum24h_mask)
+        df["reasons"] = reason_frame.apply(_build_reasons, axis=1)
 
     # Clean helper col
     if "counterparty_filled" in df.columns:
